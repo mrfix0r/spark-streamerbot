@@ -1,0 +1,1051 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Fix0r — D20 Stream Overlay</title>
+  <style>
+    html,
+    body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      background: transparent !important;
+    }
+
+    body {
+      color: #f4ead6;
+      font-family: Georgia, "Times New Roman", serif;
+    }
+
+    #scene {
+      position: fixed;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      pointer-events: none;
+    }
+
+    #preview-controls {
+      position: fixed;
+      left: 20px;
+      bottom: 20px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      max-width: calc(100vw - 40px);
+      padding: 11px 13px;
+      border: 1px solid rgba(199, 162, 96, 0.36);
+      border-radius: 12px;
+      background: rgba(10, 9, 17, 0.87);
+      box-shadow: 0 14px 40px rgba(0, 0, 0, 0.35);
+      font-family: system-ui, sans-serif;
+      font-size: 12px;
+      color: #e8dcc8;
+      backdrop-filter: blur(10px);
+      z-index: 2;
+    }
+
+    #preview-controls button {
+      padding: 7px 11px;
+      border: 1px solid rgba(203, 171, 112, 0.5);
+      border-radius: 8px;
+      background: rgba(120, 81, 186, 0.18);
+      color: #f5ebda;
+      cursor: pointer;
+      font: inherit;
+    }
+
+    #preview-controls button:hover {
+      background: rgba(125, 99, 212, 0.4);
+    }
+
+    #connection-status {
+      white-space: nowrap;
+    }
+
+    #connection-status::before {
+      display: inline-block;
+      width: 8px;
+      height: 8px;
+      margin-right: 7px;
+      border-radius: 50%;
+      background: #f27277;
+      content: "";
+      vertical-align: middle;
+    }
+
+    body[data-websocket="connected"] #connection-status::before {
+      background: #5be0bc;
+    }
+
+    body.in-obs #preview-controls {
+      display: none !important;
+    }
+
+    @media (max-width: 650px) {
+      #preview-controls {
+        left: 10px;
+        right: 10px;
+        bottom: 10px;
+        flex-wrap: wrap;
+      }
+    }
+  </style>
+</head>
+<body data-phase="idle" data-websocket="connecting">
+  <canvas id="scene" aria-label="Анимированный двадцатигранный кубик"></canvas>
+
+  <div id="preview-controls" aria-label="Панель предпросмотра">
+    <span id="connection-status">Подключение к Streamer.bot…</span>
+    <button type="button" data-roll="random">Бросить d20</button>
+    <button type="button" data-roll="20">Показать 20</button>
+    <button type="button" data-roll="1">Показать 1</button>
+  </div>
+
+  <script>
+    (() => {
+      "use strict";
+
+      // Настройки можно изменить в обычном Блокноте.
+      const CONFIG = Object.freeze({
+        websocketUrl: "ws://127.0.0.1:8080/",
+        command: "!d20",
+        rollDuration: 2550,
+        holdDuration: 3300,
+        fadeDuration: 720,
+        reconnectDelay: 1800,
+        soundEnabled: true,
+        soundVolume: 0.19,
+        globalVariableName: "fix0r_d20_roll"
+      });
+
+      const TAU = Math.PI * 2;
+      const GOLD = [221, 184, 117];
+      const CYAN = [101, 233, 221];
+      const VIOLET = [154, 103, 248];
+      const CRITICAL_GOLD = [255, 214, 117];
+      const CRITICAL_RED = [255, 94, 100];
+      const PHI = (1 + Math.sqrt(5)) / 2;
+
+      const VERTICES = [
+        [-1, PHI, 0], [1, PHI, 0], [-1, -PHI, 0], [1, -PHI, 0],
+        [0, -1, PHI], [0, 1, PHI], [0, -1, -PHI], [0, 1, -PHI],
+        [PHI, 0, -1], [PHI, 0, 1], [-PHI, 0, -1], [-PHI, 0, 1]
+      ].map(([x, y, z]) => normalize({ x, y, z }));
+
+      const FACE_VERTICES = [
+        [0, 11, 5], [0, 5, 1], [0, 1, 7], [0, 7, 10], [0, 10, 11],
+        [1, 5, 9], [5, 11, 4], [11, 10, 2], [10, 7, 6], [7, 1, 8],
+        [3, 9, 4], [3, 4, 2], [3, 2, 6], [3, 6, 8], [3, 8, 9],
+        [4, 9, 5], [2, 4, 11], [6, 2, 10], [8, 6, 7], [9, 8, 1]
+      ];
+
+      const FACE_VALUES = [
+        1, 20, 6, 15, 8, 13, 10, 11, 18, 3,
+        16, 5, 14, 7, 12, 9, 4, 17, 2, 19
+      ];
+
+      const FACES = FACE_VERTICES.map((indices, index) => {
+        const points = indices.map((vertexIndex) => VERTICES[vertexIndex]);
+        const center = normalize(points.reduce((sum, point) => add(sum, point), vector()));
+        let normal = normalize(cross(subtract(points[1], points[0]), subtract(points[2], points[0])));
+
+        if (dot(normal, center) < 0) {
+          normal = multiply(normal, -1);
+        }
+
+        return { indices, normal, value: FACE_VALUES[index] };
+      });
+
+      const canvas = document.getElementById("scene");
+      const context = canvas.getContext("2d", { alpha: true, desynchronized: true });
+      const connectionStatus = document.getElementById("connection-status");
+      const queue = [];
+
+      let width = 0;
+      let height = 0;
+      let pixelRatio = 1;
+      let activeRoll = null;
+      let animationFrame = 0;
+      let websocket = null;
+      let reconnectTimer = 0;
+      let audioContext = null;
+      let lastEventFingerprint = "";
+      let lastEventTime = 0;
+
+      function vector(x = 0, y = 0, z = 0) {
+        return { x, y, z };
+      }
+
+      function add(a, b) {
+        return vector(a.x + b.x, a.y + b.y, a.z + b.z);
+      }
+
+      function subtract(a, b) {
+        return vector(a.x - b.x, a.y - b.y, a.z - b.z);
+      }
+
+      function multiply(a, scalar) {
+        return vector(a.x * scalar, a.y * scalar, a.z * scalar);
+      }
+
+      function dot(a, b) {
+        return a.x * b.x + a.y * b.y + a.z * b.z;
+      }
+
+      function cross(a, b) {
+        return vector(
+          a.y * b.z - a.z * b.y,
+          a.z * b.x - a.x * b.z,
+          a.x * b.y - a.y * b.x
+        );
+      }
+
+      function normalize(a) {
+        const length = Math.hypot(a.x, a.y, a.z) || 1;
+        return multiply(a, 1 / length);
+      }
+
+      function clamp(value, minimum = 0, maximum = 1) {
+        return Math.min(maximum, Math.max(minimum, value));
+      }
+
+      function lerp(a, b, amount) {
+        return a + (b - a) * amount;
+      }
+
+      function easeOutCubic(value) {
+        return 1 - Math.pow(1 - clamp(value), 3);
+      }
+
+      function easeOutQuint(value) {
+        return 1 - Math.pow(1 - clamp(value), 5);
+      }
+
+      function smoothstep(value) {
+        const normalized = clamp(value);
+        return normalized * normalized * (3 - 2 * normalized);
+      }
+
+      function rgba(color, opacity = 1) {
+        return `rgba(${Math.round(color[0])}, ${Math.round(color[1])}, ${Math.round(color[2])}, ${clamp(opacity)})`;
+      }
+
+      function blend(a, b, amount) {
+        return a.map((channel, index) => lerp(channel, b[index], amount));
+      }
+
+      function quaternion(x = 0, y = 0, z = 0, w = 1) {
+        return { x, y, z, w };
+      }
+
+      function normalizeQuaternion(value) {
+        const length = Math.hypot(value.x, value.y, value.z, value.w) || 1;
+        return quaternion(value.x / length, value.y / length, value.z / length, value.w / length);
+      }
+
+      function multiplyQuaternions(a, b) {
+        return quaternion(
+          a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+          a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+          a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
+          a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z
+        );
+      }
+
+      function axisAngle(axis, angle) {
+        const unit = normalize(axis);
+        const halfAngle = angle / 2;
+        const sine = Math.sin(halfAngle);
+        return quaternion(unit.x * sine, unit.y * sine, unit.z * sine, Math.cos(halfAngle));
+      }
+
+      function rotate(point, rotation) {
+        const qVector = vector(rotation.x, rotation.y, rotation.z);
+        const twiceCross = multiply(cross(qVector, point), 2);
+        return add(point, add(multiply(twiceCross, rotation.w), cross(qVector, twiceCross)));
+      }
+
+      function rotationBetween(from, to) {
+        const first = normalize(from);
+        const second = normalize(to);
+        const cosine = dot(first, second);
+
+        if (cosine < -0.999999) {
+          const axis = Math.abs(first.x) < 0.9 ? cross(first, vector(1, 0, 0)) : cross(first, vector(0, 1, 0));
+          return axisAngle(axis, Math.PI);
+        }
+
+        const axis = cross(first, second);
+        return normalizeQuaternion(quaternion(axis.x, axis.y, axis.z, 1 + cosine));
+      }
+
+      function orientationForResult(result) {
+        const face = FACES.find((candidate) => candidate.value === result);
+        const towardViewer = rotationBetween(face.normal, vector(0, 0, 1));
+        const corner = rotate(VERTICES[face.indices[0]], towardViewer);
+        const uprightAngle = Math.PI / 2 - Math.atan2(corner.y, corner.x);
+        return normalizeQuaternion(multiplyQuaternions(axisAngle(vector(0, 0, 1), uprightAngle), towardViewer));
+      }
+
+      function setOBSMode() {
+        if (window.obsstudio) {
+          document.body.classList.add("in-obs");
+        }
+      }
+
+      function resize() {
+        width = window.innerWidth || 1920;
+        height = window.innerHeight || 1080;
+        pixelRatio = Math.min(window.devicePixelRatio || 1, 2);
+        canvas.width = Math.round(width * pixelRatio);
+        canvas.height = Math.round(height * pixelRatio);
+        canvas.style.width = `${width}px`;
+        canvas.style.height = `${height}px`;
+        context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
+
+        if (activeRoll && !animationFrame) {
+          animationFrame = requestAnimationFrame(render);
+        }
+      }
+
+      function project(point, centerX, centerY, radius) {
+        const cameraDistance = 4.4;
+        const perspective = cameraDistance / (cameraDistance - point.z);
+        return {
+          x: centerX + point.x * radius * perspective,
+          y: centerY - point.y * radius * perspective,
+          z: point.z
+        };
+      }
+
+      function polygon(points) {
+        context.beginPath();
+        context.moveTo(points[0].x, points[0].y);
+
+        for (let index = 1; index < points.length; index += 1) {
+          context.lineTo(points[index].x, points[index].y);
+        }
+
+        context.closePath();
+      }
+
+      function trackedText(text, x, y, tracking, align = "center") {
+        const characters = Array.from(text);
+        const measuredWidth = characters.reduce((total, character) => total + context.measureText(character).width, 0)
+          + Math.max(0, characters.length - 1) * tracking;
+        let cursor = x;
+
+        if (align === "center") {
+          cursor -= measuredWidth / 2;
+        } else if (align === "right") {
+          cursor -= measuredWidth;
+        }
+
+        characters.forEach((character) => {
+          context.fillText(character, cursor, y);
+          cursor += context.measureText(character).width + tracking;
+        });
+      }
+
+      function sparkle(x, y, size, color, opacity) {
+        context.save();
+        context.globalAlpha *= opacity;
+        context.strokeStyle = rgba(color, 0.95);
+        context.lineWidth = Math.max(0.8, size * 0.16);
+        context.beginPath();
+        context.moveTo(x - size, y);
+        context.lineTo(x + size, y);
+        context.moveTo(x, y - size * 1.35);
+        context.lineTo(x, y + size * 1.35);
+        context.stroke();
+        context.restore();
+      }
+
+      function accentForRoll(roll) {
+        if (roll.value === 20 && roll.settled) {
+          return CRITICAL_GOLD;
+        }
+
+        if (roll.value === 1 && roll.settled) {
+          return CRITICAL_RED;
+        }
+
+        return blend(VIOLET, CYAN, 0.34);
+      }
+
+      function drawBackdrop(centerX, centerY, scale, accent, time, settledAmount) {
+        const radius = 338 * scale;
+        const shadow = context.createRadialGradient(centerX, centerY + 24 * scale, 10, centerX, centerY + 24 * scale, radius);
+        shadow.addColorStop(0, "rgba(7, 5, 13, 0.87)");
+        shadow.addColorStop(0.53, "rgba(8, 6, 17, 0.68)");
+        shadow.addColorStop(0.82, "rgba(8, 6, 17, 0.24)");
+        shadow.addColorStop(1, "rgba(8, 6, 17, 0)");
+        context.fillStyle = shadow;
+        context.beginPath();
+        context.ellipse(centerX, centerY + 27 * scale, radius * 0.99, radius * 1.23, 0, 0, TAU);
+        context.fill();
+
+        const aura = context.createRadialGradient(centerX, centerY, 62 * scale, centerX, centerY, 272 * scale);
+        aura.addColorStop(0, rgba(accent, 0.13 + settledAmount * 0.07));
+        aura.addColorStop(0.62, rgba(accent, 0.075));
+        aura.addColorStop(1, rgba(accent, 0));
+        context.fillStyle = aura;
+        context.beginPath();
+        context.arc(centerX, centerY, 273 * scale, 0, TAU);
+        context.fill();
+
+        context.save();
+        context.translate(centerX, centerY);
+
+        const orbit = 246 * scale;
+        context.lineWidth = Math.max(1, 1.05 * scale);
+        context.strokeStyle = rgba(GOLD, 0.55);
+        context.beginPath();
+        context.arc(0, 0, orbit, -Math.PI * 0.88, -Math.PI * 0.12);
+        context.arc(0, 0, orbit, Math.PI * 0.12, Math.PI * 0.88);
+        context.stroke();
+
+        context.setLineDash([3.5 * scale, 11 * scale]);
+        context.strokeStyle = rgba(accent, 0.63);
+        context.lineDashOffset = -time * 0.025 * scale;
+        context.beginPath();
+        context.arc(0, 0, orbit - 13 * scale, 0, TAU);
+        context.stroke();
+        context.setLineDash([]);
+
+        context.rotate(time * 0.00016);
+
+        for (let index = 0; index < 12; index += 1) {
+          const angle = index * TAU / 12;
+          const x = Math.cos(angle) * (orbit + 10 * scale);
+          const y = Math.sin(angle) * (orbit + 10 * scale);
+          const size = (index % 3 === 0 ? 4.7 : 2.6) * scale;
+          context.save();
+          context.translate(x, y);
+          context.rotate(angle + Math.PI / 4);
+          context.fillStyle = rgba(index % 3 === 0 ? GOLD : accent, index % 3 === 0 ? 0.8 : 0.64);
+          context.fillRect(-size / 2, -size / 2, size, size);
+          context.restore();
+        }
+
+        context.restore();
+      }
+
+      function drawDie(rotation, centerX, centerY, radius, accent, settledAmount, result) {
+        const rotatedVertices = VERTICES.map((point) => rotate(point, rotation));
+        const light = normalize(vector(-0.48, 0.76, 0.87));
+
+        const visibleFaces = FACES.map((face) => {
+          const normal = rotate(face.normal, rotation);
+          const points = face.indices.map((index) => rotatedVertices[index]);
+          const averageDepth = points.reduce((sum, point) => sum + point.z, 0) / points.length;
+
+          return {
+            value: face.value,
+            normal,
+            averageDepth,
+            points: points.map((point) => project(point, centerX, centerY, radius))
+          };
+        }).filter((face) => face.normal.z > -0.045).sort((a, b) => a.averageDepth - b.averageDepth);
+
+        context.save();
+        context.shadowColor = rgba(accent, 0.54 + settledAmount * 0.2);
+        context.shadowBlur = radius * 0.15;
+
+        visibleFaces.forEach((face) => {
+          const brightness = clamp(dot(face.normal, light) * 0.64 + 0.43, 0.08, 1);
+          const isResultFace = face.value === result && settledAmount > 0;
+          const baseDark = [15, 10, 34];
+          const baseLight = blend([61, 34, 106], accent, 0.34);
+          const brighter = blend(baseDark, baseLight, brightness);
+          const resultTint = result === 20 ? [87, 61, 19] : result === 1 ? [98, 26, 37] : [51, 36, 102];
+          const faceColor = isResultFace ? blend(brighter, resultTint, settledAmount * 0.56) : brighter;
+          const top = Math.min(...face.points.map((point) => point.y));
+          const bottom = Math.max(...face.points.map((point) => point.y));
+          const gradient = context.createLinearGradient(centerX, top, centerX, bottom + 1);
+          gradient.addColorStop(0, rgba(blend(faceColor, [155, 115, 194], 0.2), 0.97));
+          gradient.addColorStop(1, rgba(blend(faceColor, [5, 5, 16], 0.35), 0.99));
+
+          polygon(face.points);
+          context.fillStyle = gradient;
+          context.fill();
+          context.shadowBlur = 0;
+          context.lineWidth = Math.max(1.1, radius * 0.012);
+          context.strokeStyle = rgba(isResultFace ? blend(GOLD, accent, settledAmount * 0.5) : GOLD, isResultFace ? 0.97 : 0.69);
+          context.stroke();
+
+          if (face.normal.z > 0.12) {
+            const textX = face.points.reduce((sum, point) => sum + point.x, 0) / 3;
+            const textY = face.points.reduce((sum, point) => sum + point.y, 0) / 3;
+            const area = Math.abs(
+              (face.points[0].x * (face.points[1].y - face.points[2].y)
+                + face.points[1].x * (face.points[2].y - face.points[0].y)
+                + face.points[2].x * (face.points[0].y - face.points[1].y)) / 2
+            );
+            const fontSize = Math.max(11, Math.sqrt(area) * (isResultFace ? 0.59 : 0.49));
+
+            context.save();
+            context.globalAlpha *= clamp(face.normal.z * 1.35, 0, 0.97);
+            context.textAlign = "center";
+            context.textBaseline = "middle";
+            context.font = `600 ${fontSize}px Georgia, serif`;
+            context.shadowColor = "rgba(0, 0, 0, 0.9)";
+            context.shadowBlur = fontSize * 0.16;
+            context.fillStyle = rgba(isResultFace ? blend([251, 240, 218], accent, settledAmount * 0.23) : [230, 211, 179], 0.95);
+            context.fillText(String(face.value), textX, textY + fontSize * 0.04);
+            context.restore();
+          }
+        });
+
+        context.restore();
+      }
+
+      function createParticle(roll, centerX, centerY, scale, burst = false) {
+        const angle = Math.random() * TAU;
+        const initialRadius = burst ? 24 + Math.random() * 100 : 158 + Math.random() * 91;
+        const speed = burst ? 80 + Math.random() * 290 : 7 + Math.random() * 31;
+        const accent = accentForRoll(roll);
+        const color = Math.random() > 0.55 ? accent : GOLD;
+
+        roll.particles.push({
+          x: centerX + Math.cos(angle) * initialRadius * scale,
+          y: centerY + Math.sin(angle) * initialRadius * scale,
+          velocityX: Math.cos(angle) * speed * scale,
+          velocityY: Math.sin(angle) * speed * scale - (burst ? 20 : 11) * scale,
+          life: burst ? 600 + Math.random() * 1050 : 620 + Math.random() * 900,
+          age: 0,
+          size: (burst ? 1.1 + Math.random() * 3.4 : 0.8 + Math.random() * 2) * scale,
+          color,
+          star: burst && Math.random() > 0.79
+        });
+
+        if (roll.particles.length > 210) {
+          roll.particles.shift();
+        }
+      }
+
+      function updateParticles(roll, delta, centerX, centerY, scale, rolling) {
+        if (rolling) {
+          createParticle(roll, centerX, centerY, scale);
+
+          if (Math.random() > 0.45) {
+            createParticle(roll, centerX, centerY, scale);
+          }
+        }
+
+        roll.particles = roll.particles.filter((particle) => {
+          particle.age += delta;
+          particle.x += particle.velocityX * delta / 1000;
+          particle.y += particle.velocityY * delta / 1000;
+          particle.velocityX *= Math.pow(0.18, delta / 1000);
+          particle.velocityY *= Math.pow(0.38, delta / 1000);
+
+          if (particle.age >= particle.life) {
+            return false;
+          }
+
+          const fade = Math.sin(clamp(particle.age / particle.life) * Math.PI);
+
+          if (particle.star) {
+            sparkle(particle.x, particle.y, particle.size * 2, particle.color, fade);
+          } else {
+            context.fillStyle = rgba(particle.color, fade * 0.9);
+            context.beginPath();
+            context.arc(particle.x, particle.y, particle.size, 0, TAU);
+            context.fill();
+          }
+
+          return true;
+        });
+      }
+
+      function drawTypography(roll, centerX, centerY, scale, time, settledAmount, accent) {
+        context.save();
+        context.textAlign = "left";
+        context.textBaseline = "middle";
+        context.font = `500 ${15 * scale}px Georgia, serif`;
+        context.fillStyle = rgba(GOLD, 0.79);
+        trackedText("ИСПЫТАНИЕ СУДЬБЫ", centerX, centerY - 322 * scale, 4.1 * scale);
+
+        const ruleY = centerY - 289 * scale;
+        context.strokeStyle = rgba(GOLD, 0.61);
+        context.lineWidth = Math.max(0.9, 1.05 * scale);
+        context.beginPath();
+        context.moveTo(centerX - 157 * scale, ruleY);
+        context.lineTo(centerX - 27 * scale, ruleY);
+        context.moveTo(centerX + 27 * scale, ruleY);
+        context.lineTo(centerX + 157 * scale, ruleY);
+        context.stroke();
+        sparkle(centerX, ruleY, 6 * scale, GOLD, 0.95);
+
+        const displayName = String(roll.user || "Странник").slice(0, 34);
+        context.textAlign = "center";
+        context.font = `600 ${24 * scale}px Georgia, serif`;
+        context.fillStyle = rgba([246, 233, 213], 0.93);
+        context.shadowColor = "rgba(0, 0, 0, 0.8)";
+        context.shadowBlur = 10 * scale;
+        context.fillText(displayName, centerX, centerY - 263 * scale);
+        context.shadowBlur = 0;
+
+        const resultOpacity = settledAmount;
+        const pulse = 0.86 + Math.sin(time * 0.0021) * 0.14;
+
+        if (settledAmount < 1) {
+          context.globalAlpha *= 1 - settledAmount;
+          context.font = `500 ${16 * scale}px Georgia, serif`;
+          context.fillStyle = rgba(GOLD, pulse);
+          trackedText("БРОСОК d20", centerX, centerY + 268 * scale, 3.1 * scale);
+          context.globalAlpha /= Math.max(0.0001, 1 - settledAmount);
+        }
+
+        if (resultOpacity > 0) {
+          context.save();
+          context.globalAlpha *= resultOpacity;
+          context.textAlign = "center";
+          context.textBaseline = "middle";
+          context.font = `600 ${76 * scale}px Georgia, serif`;
+          context.shadowColor = rgba(accent, 0.76);
+          context.shadowBlur = 24 * scale;
+          context.fillStyle = rgba(blend([255, 247, 222], accent, roll.value === 1 || roll.value === 20 ? 0.18 : 0.07), 1);
+          context.fillText(String(roll.value), centerX, centerY + 275 * scale);
+          context.shadowBlur = 0;
+
+          const verdict = roll.value === 20
+            ? "КРИТИЧЕСКИЙ УСПЕХ"
+            : roll.value === 1
+              ? "КРИТИЧЕСКИЙ ПРОВАЛ"
+              : "РЕЗУЛЬТАТ БРОСКА";
+
+          context.textAlign = "left";
+          context.font = `500 ${13.5 * scale}px Georgia, serif`;
+          context.fillStyle = rgba(roll.value === 1 || roll.value === 20 ? accent : GOLD, 0.91);
+          trackedText(verdict, centerX, centerY + 331 * scale, 2.5 * scale);
+          context.restore();
+        }
+
+        context.font = `500 ${11 * scale}px Georgia, serif`;
+        context.fillStyle = rgba(CYAN, 0.55);
+        trackedText("TRUST THE GAME", centerX, centerY + 370 * scale, 3.7 * scale);
+        context.restore();
+      }
+
+      function getAudioContext() {
+        if (!CONFIG.soundEnabled) {
+          return null;
+        }
+
+        try {
+          if (!audioContext) {
+            const AudioConstructor = window.AudioContext || window.webkitAudioContext;
+            audioContext = AudioConstructor ? new AudioConstructor() : null;
+          }
+
+          if (audioContext && audioContext.state === "suspended") {
+            audioContext.resume().catch(() => {});
+          }
+
+          return audioContext;
+        } catch (_error) {
+          return null;
+        }
+      }
+
+      function tone(frequency, delay, duration, type, gain) {
+        const audio = getAudioContext();
+
+        if (!audio) {
+          return;
+        }
+
+        try {
+          const oscillator = audio.createOscillator();
+          const volume = audio.createGain();
+          const start = audio.currentTime + delay;
+          oscillator.type = type;
+          oscillator.frequency.setValueAtTime(frequency, start);
+          oscillator.frequency.exponentialRampToValueAtTime(Math.max(40, frequency * 0.77), start + duration);
+          volume.gain.setValueAtTime(0.0001, start);
+          volume.gain.exponentialRampToValueAtTime(Math.max(0.0001, gain * CONFIG.soundVolume), start + 0.015);
+          volume.gain.exponentialRampToValueAtTime(0.0001, start + duration);
+          oscillator.connect(volume);
+          volume.connect(audio.destination);
+          oscillator.start(start);
+          oscillator.stop(start + duration + 0.025);
+        } catch (_error) {
+          // OBS может запретить автозапуск звука: анимация всё равно работает.
+        }
+      }
+
+      function rollSound() {
+        [0, 0.095, 0.23, 0.41, 0.63].forEach((delay, index) => {
+          tone(185 + index * 34, delay, 0.09 + index * 0.015, "triangle", 0.36 - index * 0.035);
+        });
+      }
+
+      function landingSound(result) {
+        if (result === 20) {
+          [523.25, 659.25, 783.99, 1046.5].forEach((frequency, index) => {
+            tone(frequency, index * 0.11, 0.55, "sine", 0.36);
+          });
+          return;
+        }
+
+        if (result === 1) {
+          tone(156, 0, 0.64, "sawtooth", 0.22);
+          tone(117, 0.16, 0.67, "triangle", 0.29);
+          return;
+        }
+
+        tone(392, 0, 0.32, "triangle", 0.29);
+        tone(587.33, 0.09, 0.43, "sine", 0.24);
+      }
+
+      function render(now) {
+        animationFrame = 0;
+        context.clearRect(0, 0, width, height);
+
+        if (!activeRoll) {
+          return;
+        }
+
+        const roll = activeRoll;
+        const elapsed = now - roll.startedAt;
+        const totalDuration = CONFIG.rollDuration + CONFIG.holdDuration + CONFIG.fadeDuration;
+
+        if (elapsed >= totalDuration) {
+          activeRoll = null;
+          document.body.dataset.phase = "idle";
+          document.body.dataset.result = "";
+          document.body.dataset.user = "";
+
+          if (queue.length > 0) {
+            const next = queue.shift();
+            beginRoll(next.value, next.user, next.fingerprint);
+          }
+
+          return;
+        }
+
+        const scale = clamp(Math.min(width / 1120, height / 910), 0.46, 1.35);
+        const centerX = width / 2;
+        const centerY = height * 0.474;
+        const rollingProgress = clamp(elapsed / CONFIG.rollDuration);
+        const settledAmount = smoothstep((elapsed - CONFIG.rollDuration + 220) / 420);
+        const introOpacity = easeOutCubic(elapsed / 370);
+        const fadeProgress = clamp((elapsed - CONFIG.rollDuration - CONFIG.holdDuration) / CONFIG.fadeDuration);
+        const opacity = introOpacity * (1 - easeOutCubic(fadeProgress));
+        const introScale = 0.89 + easeOutCubic(elapsed / 510) * 0.11;
+        const exitScale = 1 - fadeProgress * 0.055;
+        const accent = accentForRoll(roll);
+        const delta = Math.min(48, Math.max(0, now - roll.lastFrameAt));
+        roll.lastFrameAt = now;
+
+        if (!roll.settled && elapsed >= CONFIG.rollDuration) {
+          roll.settled = true;
+          document.body.dataset.phase = "result";
+          landingSound(roll.value);
+
+          const burstCount = roll.value === 1 || roll.value === 20 ? 82 : 48;
+
+          for (let index = 0; index < burstCount; index += 1) {
+            createParticle(roll, centerX, centerY, scale, true);
+          }
+        }
+
+        context.save();
+        context.globalAlpha = opacity;
+        context.translate(centerX, centerY);
+        context.scale(introScale * exitScale, introScale * exitScale);
+        context.translate(-centerX, -centerY);
+
+        drawBackdrop(centerX, centerY, scale, accent, now, settledAmount);
+        updateParticles(roll, delta, centerX, centerY, scale, !roll.settled);
+
+        const spinRemainder = (1 - easeOutQuint(rollingProgress)) * roll.turns;
+        const spin = axisAngle(roll.axis, spinRemainder);
+        const wobble = axisAngle(vector(1, 0.15, 0), Math.sin(elapsed * 0.014) * (1 - rollingProgress) * 0.12);
+        const rotation = normalizeQuaternion(multiplyQuaternions(wobble, multiplyQuaternions(spin, roll.target)));
+        const bounce = Math.sin(rollingProgress * Math.PI * 5) * Math.pow(1 - rollingProgress, 1.45) * 12 * scale;
+        const dieRadius = 181 * scale * (1 + Math.sin(elapsed * 0.0048) * (1 - rollingProgress) * 0.027);
+        drawDie(rotation, centerX, centerY + bounce, dieRadius, accent, settledAmount, roll.value);
+        drawTypography(roll, centerX, centerY, scale, now, settledAmount, accent);
+
+        if (roll.settled && (roll.value === 20 || roll.value === 1)) {
+          const criticalAge = elapsed - CONFIG.rollDuration;
+          const flashOpacity = Math.max(0, 1 - criticalAge / 440) * 0.17;
+
+          if (flashOpacity > 0) {
+            const flash = context.createRadialGradient(centerX, centerY, 0, centerX, centerY, 390 * scale);
+            flash.addColorStop(0, rgba(accent, flashOpacity));
+            flash.addColorStop(1, rgba(accent, 0));
+            context.fillStyle = flash;
+            context.beginPath();
+            context.arc(centerX, centerY, 390 * scale, 0, TAU);
+            context.fill();
+          }
+        }
+
+        context.restore();
+        animationFrame = requestAnimationFrame(render);
+      }
+
+      function beginRoll(value, user = "Странник", fingerprint = "") {
+        const result = Number(value);
+
+        if (!Number.isInteger(result) || result < 1 || result > 20) {
+          return false;
+        }
+
+        if (activeRoll) {
+          queue.push({ value: result, user, fingerprint });
+          return true;
+        }
+
+        const seed = Math.random();
+        activeRoll = {
+          value: result,
+          user: String(user || "Странник"),
+          fingerprint,
+          startedAt: performance.now(),
+          lastFrameAt: performance.now(),
+          target: orientationForResult(result),
+          axis: normalize(vector(0.78 + seed * 0.17, 0.53 - seed * 0.19, 0.39 + seed * 0.12)),
+          turns: Math.PI * (9.1 + seed * 1.8),
+          particles: [],
+          settled: false
+        };
+
+        document.body.dataset.phase = "rolling";
+        document.body.dataset.result = String(result);
+        document.body.dataset.user = String(user || "Странник");
+        rollSound();
+
+        if (!animationFrame) {
+          animationFrame = requestAnimationFrame(render);
+        }
+
+        return true;
+      }
+
+      function readPrimitive(value) {
+        if (value && typeof value === "object") {
+          return value.value ?? value.Value ?? value.display ?? value.name ?? "";
+        }
+
+        return value;
+      }
+
+      function fingerprintFor(data, result, user) {
+        return String(data.id || data.actionId || "") + ":" + String(data.completedAt || "") + ":" + result + ":" + user;
+      }
+
+      function enqueueEvent(result, user, fingerprint) {
+        const now = performance.now();
+        const duplicateWindow = CONFIG.rollDuration + CONFIG.holdDuration + CONFIG.fadeDuration + 1000;
+
+        if (fingerprint === lastEventFingerprint && now - lastEventTime < duplicateWindow) {
+          return false;
+        }
+
+        lastEventFingerprint = fingerprint;
+        lastEventTime = now;
+        return beginRoll(result, user, fingerprint);
+      }
+
+      function processCompletedAction(data) {
+        const argumentsStack = data.arguments || data.args || {};
+        const command = String(readPrimitive(argumentsStack.command || argumentsStack.commandName || data.command || ""))
+          .trim()
+          .toLowerCase();
+        const actionName = String(data.name || "").toLowerCase();
+        const isDiceCommand = command === CONFIG.command.toLowerCase()
+          || command.startsWith(`${CONFIG.command.toLowerCase()} `)
+          || (!command && actionName.includes("d20"));
+
+        if (!isDiceCommand) {
+          return false;
+        }
+
+        const result = Number(readPrimitive(argumentsStack.randomNumber ?? argumentsStack.result ?? argumentsStack.roll));
+        const user = readPrimitive(argumentsStack.user)
+          || readPrimitive(argumentsStack.userName)
+          || readPrimitive(data.user && data.user.display)
+          || readPrimitive(data.user && data.user.name)
+          || "Странник";
+
+        return enqueueEvent(result, String(user), fingerprintFor(data, result, user));
+      }
+
+      function processGlobalVariable(data) {
+        const details = data.global || data.variable || data;
+        const name = String(details.name || details.variableName || data.name || "");
+
+        if (name !== CONFIG.globalVariableName) {
+          return false;
+        }
+
+        const rawValue = String(readPrimitive(details.newValue ?? details.value ?? data.newValue ?? data.value) || "");
+        const [result, user = "Странник", counter = ""] = rawValue.split("|");
+        return enqueueEvent(Number(result), user, `${name}:${rawValue}:${counter}`);
+      }
+
+      function processCustomEvent(data) {
+        let payload = data;
+
+        if (typeof data === "string") {
+          try {
+            payload = JSON.parse(data);
+          } catch (_error) {
+            return false;
+          }
+        }
+
+        if (payload && typeof payload.data === "string") {
+          try {
+            payload = JSON.parse(payload.data);
+          } catch (_error) {
+            return false;
+          }
+        }
+
+        if (!payload || !["dice-roll", "d20-roll", "fix0r-d20"].includes(String(payload.type || ""))) {
+          return false;
+        }
+
+        const result = Number(payload.result ?? payload.value);
+        const user = String(payload.user || payload.userName || "Странник");
+        return enqueueEvent(result, user, String(payload.id || `${result}:${user}:${Date.now()}`));
+      }
+
+      function handleServerMessage(input) {
+        let message = input;
+
+        if (typeof input === "string") {
+          try {
+            message = JSON.parse(input);
+          } catch (_error) {
+            return false;
+          }
+        }
+
+        if (!message || typeof message !== "object") {
+          return false;
+        }
+
+        const source = String(message.event && message.event.source || "").toLowerCase();
+        const type = String(message.event && message.event.type || "").toLowerCase();
+        const data = message.data || message;
+
+        if (source === "raw" && type === "actioncompleted") {
+          return processCompletedAction(data);
+        }
+
+        if (source === "misc" && (type === "globalvariableupdated" || type === "globalvariablecreated")) {
+          return processGlobalVariable(data);
+        }
+
+        if (source === "general" && type === "custom") {
+          return processCustomEvent(data);
+        }
+
+        if (message.type && !message.event) {
+          return processCustomEvent(message);
+        }
+
+        return false;
+      }
+
+      function subscribe(socket, name, events) {
+        socket.send(JSON.stringify({
+          request: "Subscribe",
+          id: `fix0r-d20-${name}`,
+          events
+        }));
+      }
+
+      function connect() {
+        clearTimeout(reconnectTimer);
+        document.body.dataset.websocket = "connecting";
+        connectionStatus.textContent = "Подключение к Streamer.bot…";
+
+        try {
+          websocket = new WebSocket(CONFIG.websocketUrl);
+        } catch (_error) {
+          scheduleReconnect();
+          return;
+        }
+
+        websocket.addEventListener("open", () => {
+          document.body.dataset.websocket = "connected";
+          connectionStatus.textContent = "Streamer.bot подключён";
+          subscribe(websocket, "raw", { Raw: ["ActionCompleted"] });
+          subscribe(websocket, "globals", { Misc: ["GlobalVariableCreated", "GlobalVariableUpdated"] });
+          subscribe(websocket, "custom", { General: ["Custom"] });
+        });
+
+        websocket.addEventListener("message", (event) => {
+          handleServerMessage(event.data);
+        });
+
+        websocket.addEventListener("error", () => {
+          document.body.dataset.websocket = "disconnected";
+          connectionStatus.textContent = "Streamer.bot не подключён";
+        });
+
+        websocket.addEventListener("close", scheduleReconnect);
+      }
+
+      function scheduleReconnect() {
+        document.body.dataset.websocket = "disconnected";
+        connectionStatus.textContent = "Запусти WebSocket Server :8080";
+        clearTimeout(reconnectTimer);
+        reconnectTimer = window.setTimeout(connect, CONFIG.reconnectDelay);
+      }
+
+      document.getElementById("preview-controls").addEventListener("click", (event) => {
+        const button = event.target.closest("button[data-roll]");
+
+        if (!button) {
+          return;
+        }
+
+        const chosen = button.dataset.roll === "random"
+          ? 1 + Math.floor(Math.random() * 20)
+          : Number(button.dataset.roll);
+        beginRoll(chosen, "Fix0r");
+      });
+
+      window.addEventListener("keydown", (event) => {
+        if (event.key.toLowerCase() === "r") {
+          beginRoll(1 + Math.floor(Math.random() * 20), "Fix0r");
+        }
+      });
+
+      window.addEventListener("resize", resize);
+      window.addEventListener("load", setOBSMode);
+      window.setTimeout(setOBSMode, 200);
+      window.setTimeout(setOBSMode, 1000);
+
+      window.__FIX0R_D20__ = {
+        roll: beginRoll,
+        receive: handleServerMessage,
+        state: () => ({
+          phase: document.body.dataset.phase,
+          result: document.body.dataset.result || null,
+          user: document.body.dataset.user || null,
+          queued: queue.length,
+          websocket: document.body.dataset.websocket
+        }),
+        config: CONFIG
+      };
+
+      resize();
+      setOBSMode();
+      connect();
+    })();
+  </script>
+</body>
+</html>

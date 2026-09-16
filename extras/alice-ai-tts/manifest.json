@@ -1,0 +1,17 @@
+{
+  "manifest_version": 3,
+  "name": "Alice AI TTS",
+  "version": "1.0.0",
+  "description": "Автоматически озвучивает новые текстовые ответы Алисы AI.",
+  "content_scripts": [
+    {
+      "matches": [
+        "https://alice.yandex.ru/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}
